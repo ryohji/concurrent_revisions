@@ -1,0 +1,133 @@
+﻿class Versioned {
+  void Release();
+  void Collapse(Revision main, Segment parent);
+  void Merge(Revision main, Revision joinRev, Segment join);
+}
+
+public class Versioned<T> : Versioned {
+  Map<int, T> versions; // map from version to value
+
+  // Revision.currentRevision は thread local ストレージ上の Revision
+  public T Get() { return Get(Revision.currentRevision); }
+  public void Set(T value) { Set(Revision.currentRevision, value); }
+
+  T Get(Revision r) {
+    Segment s = r.current;
+    while (versions[s.version] = ⊥) {
+      s = s.parent;
+    } // 値が設定されている最古のバージョンを探す (現バージョンから見て最新の値)
+    return versions[s.version];
+  }
+
+  Set(Revision r, T value) {
+    if (versions[r.current.version] = ⊥) {
+      r.current.written.Add(this);
+    } // 現行バージョンがマップになければカレントセグメントにこのリビジョンを追加
+    version[r.current.version] = value; // マップの値を更新
+  }
+
+  void Release(Segment release) {
+    versions[release.verison] = ⊥; // このバージョンで設定された値を削除
+  }
+
+  void Collapse(Revision main, Segment parent) {
+    if (versions[main.current.version] = ⊥) { // 指定リビジョンのカレントバージョンに値がなければ…
+      Set(main, versions[parent.version]); // 指定リビジョンに、指定セグメントのバージョンの値を設定
+    }
+    versions[parent.version] = ⊥;
+  }
+
+  void Merge(Revision main, Revision joinRev, Segment join) {
+    Segment s = joinRev.current;
+    while (versions[s.version] = ⊥) { // Join するリビジョンの中で、値が設定されたセグメントを探す
+      s = s.parent;
+    }
+    if (s = join) { // only merge if this was the last write
+      Set(main, versions[join.version]);
+    }
+  }
+}
+
+public class Revision {
+  Segment root;
+  Segment current;
+  Task task;
+  threadlocal static Revision currentRevision;
+
+  Revision(Segment root, Segment current) {
+    this.root = root;
+    this.current = current;
+  }
+
+  public Revision Fork(Action action) {
+    Revision r;
+    r = new Revision(current, new Segment(current)); // 現セグメントをルートに持ち、
+    // 現セグメントから作成した新セグメントをカレントにした新リビジョンを作成。
+    // この時点でバージョンがひとつ進んでいる
+    current.Release(); // cannot bring refcount to zero
+    // 直前の new Segment(current) で増加した参照カウントをひとつ減らす
+    current = new Segment(current);
+    // さらにもうひとつ、現セグメントをもとに新セグメントをつくり、 current に記録
+    task = Task.StartNew(delegate () {
+      Revision previous = currentRevision;
+      currentRevision = r;
+      try { action(); } // Fork 開始時点の +1 バージョンセグメントを持つリビジョンで action を実行
+      finally { crrentRevision = previous; }
+    });
+    return r;
+  }
+
+  public void Join(Revision join) {
+    try {
+      join.task.Wait();
+      Segment s = join.current;
+      while (s != join.root) { // Join するリビジョンのカレントからルートに向かってマージを繰り返す
+        foreach (Versioned v in s.written) { // そのセグメント内で設定された値を…
+          v.Merge(this, join, s); // マージする
+        }
+        s = s.parent;
+      }
+    }
+    finally {
+      join.current.Release();
+      current.Collapse(this);
+    }
+  }
+}
+
+class Segment {
+  Segment parent;
+  int version;
+  int refcount;
+  List<Versioned> written;
+  static int versionCount = 0; // バージョン番号は全スレッドで共有
+
+  Segment(Segment parent) {
+    this.parent = parent;
+    if (parent != NULL) parent.refcount++;
+    written = new List<Versioned>();
+    version = versionCount++; // 現在のバージョン番号で新セグメントを初期化、バージョンをひとつ進める
+    refcount = 1;
+  }
+
+  void Release() {
+    if (--refcount = 0) { // 参照カウント減らす。　結果 0 になったら…
+      foreach (Versioned v in written) {
+        v.Release(this); // このセグメントのバージョンの値を切り離し
+      }
+      if (parent != NULL) parent.Release(); // 親セグメントの参照カウントも減らす
+    }
+  }
+
+  void Collapse(Revision main) {
+    // assert: main.current = this
+    while (parent != main.root && parent.refcount = 1) { // このセグメントの親が、指定されたリビジョンの
+    // ルートでなく、かつ、セグメントの親の参照カウントが 1 であるなら…
+    // （つまり、このセグメント (のみ) が所有しているセグメントであるので）
+      foreach (Versioned v in parent.written) {
+        v.Collapse(main, parent); // 親セグメント内の書き込まれた値リスト内の値をつぶして…
+      }
+      parent = parent.parent; // remove parent // このセグメントの親を、ひとつ前の親に設定しなおす
+    } // 最終的に、指定リビジョンのルートセグメントか、まだ Join されていないリビジョンまで戻る (はず)
+  }
+}
